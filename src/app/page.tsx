@@ -1421,4 +1421,1560 @@ function CursorRow({ state }: { state: CursorState }) {
         {entry && (
           <>
             <span className="cp-lb">핫스팟 X</span>
-            <KStep value={entry.hx} min={0} max={32
+            <KStep value={entry.hx} min={0} max={32} step={1} onChange={v => setEntry({ hx: v })} />
+            <span className="cp-lb">Y</span>
+            <KStep value={entry.hy} min={0} max={32} step={1} onChange={v => setEntry({ hy: v })} />
+            <button className="btn btn-ghost" style={{ height: 33, padding: '0 12px', fontSize: 11 }}
+              onClick={() => {
+                const next = { ...st.states };
+                delete next[state];
+                patch({ states: next });
+              }}>REMOVE</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CursorPane() {
+  const [st, patch] = useCursorSettings();
+  return (
+    <div className="set-sec">
+      <h3>마우스 커서</h3>
+      <div className="d">상태별 커서 등록 및 핫스팟 설정</div>
+      <div className="set-row">
+        <div className="l"><b>커스텀 커서 사용</b><small>끄면 전부 기본 커서로</small></div>
+        <KToggle checked={st.enabled} onChange={v => patch({ enabled: v })} />
+      </div>
+      {(Object.keys(CURSOR_STATE_LABEL) as CursorState[]).map(s => <CursorRow key={s} state={s} />)}
+    </div>
+  );
+}
+
+function DataPane() {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetAsk, setResetAsk] = useState(false);
+  const [picked, setPicked] = useState<string[]>([]);
+  const [pushing, setPushing] = useState(false);
+  const serverOn = isServerMode();
+  const [unsynced, setUnsynced] = useState<string[]>([]);
+  useEffect(() => { setUnsynced(unsyncedSettingKeys()); }, []);
+
+  const [orphans, setOrphans] = useState<{ ref: string; size: number }[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [cleanAsk, setCleanAsk] = useState(false);
+  const orphanMB = (orphans ?? []).reduce((s, f) => s + f.size, 0) / 1048576;
+
+  const scanOrphans = async () => {
+    const be = backend();
+    if (!be) { toast('서버에 연결돼 있지 않습니다'); return; }
+    setScanning(true);
+    try {
+      const rows = await findOrphanFiles(be);
+      setOrphans(rows);
+      toast(rows.length ? `쓰지 않는 이미지 ${rows.length}개를 찾았습니다` : '정리할 이미지가 없습니다');
+    } catch (e) {
+      toast(e instanceof Error && e.message ? e.message : '이미지 목록을 읽지 못했습니다');
+    }
+    setScanning(false);
+  };
+
+  const cleanOrphans = async () => {
+    const be = backend();
+    if (!be || !orphans) return;
+    setScanning(true);
+    let n = 0;
+    for (const f of orphans) {
+      try { await be.deleteFile(f.ref); n += 1; } catch {}
+    }
+    setOrphans(null);
+    setScanning(false);
+    toast(`이미지 ${n}개를 지웠습니다`);
+  };
+
+  const [chars, setChars] = useLocalList<Character>('ohome.chars.v1', CHAR_SEED);
+  const [rels] = useLocalList<Relation>('ohome.rels.v1', REL_SEED);
+  const [charAsk, setCharAsk] = useState(false);
+  const orphanChars = useMemo(() => {
+    const used = new Set<string>();
+    rels.forEach(r => r.members.forEach(m => used.add(m.charId)));
+    return chars.filter(c => !c.own && !used.has(c.id));
+  }, [chars, rels]);
+
+  const cleanChars = () => {
+    const gone = new Set(orphanChars.map(c => c.id));
+    setChars(chars.filter(c => !gone.has(c.id)));
+    toast(`상대 캐릭터 ${gone.size}명을 지웠습니다`);
+  };
+
+  const doPush = async () => {
+    setPushing(true);
+    try {
+      const n = await pushLocalSettings(SETTING_KEYS);
+      toast(n > 0 ? `설정 ${n}건을 서버에 올렸습니다` : '올릴 설정이 없습니다');
+      setUnsynced(unsyncedSettingKeys());
+    } catch {
+      toast('설정 업로드에 실패했습니다');
+    }
+    setPushing(false);
+  };
+  const toggle = (k: string, v: boolean) => setPicked(p => (v ? [...new Set([...p, k])] : p.filter(x => x !== k)));
+
+  const [migOpen, setMigOpen] = useState(false);
+  const [migKind, setMigKind] = useState<BackendKind>('supabase');
+  const [migSb, setMigSb] = useState({ url: '', anonKey: '' });
+  const [migFb, setMigFb] = useState({ apiKey: '', authDomain: '', projectId: '', storageBucket: '', appId: '' });
+  const [migState, setMigState] = useState<'idle' | 'checking' | 'ready' | 'running' | 'done'>('idle');
+  const [migMsg, setMigMsg] = useState('');
+
+  const migCfg = (): BackendConfig => (migKind === 'firebase'
+    ? {
+        kind: 'firebase',
+        apiKey: migFb.apiKey.trim(),
+        authDomain: migFb.authDomain.trim() || `${migFb.projectId.trim()}.firebaseapp.com`,
+        projectId: migFb.projectId.trim(),
+        storageBucket: migFb.storageBucket.trim() || `${migFb.projectId.trim()}.appspot.com`,
+        appId: migFb.appId.trim(),
+      }
+    : { kind: 'supabase', url: migSb.url.trim(), anonKey: migSb.anonKey.trim() });
+
+  const migCheck = async () => {
+    const bad = validateConfig(migCfg());
+    if (bad) { setMigMsg(bad); setMigState('idle'); return; }
+    setMigState('checking'); setMigMsg('');
+    try {
+      const be = await createBackend(migCfg());
+      const r = await be.check();
+      setMigMsg(r.message);
+      setMigState(r.ok ? 'ready' : 'idle');
+    } catch (e) {
+      setMigMsg(`연결에 실패했습니다 — ${(e as { message?: string })?.message ?? ''}`);
+      setMigState('idle');
+    }
+  };
+
+  const migRun = async () => {
+    setMigState('running');
+    try {
+      const target = await createBackend(migCfg());
+      const r = await migrateTo(target, (m, done, total) => {
+        setMigMsg(total ? `${m} (${done}/${total})` : m);
+      });
+      setMigMsg(`이전 완료 — 항목 ${r.items}건 · 이미지 ${r.files}개`);
+      setMigState('done');
+    } catch (e) {
+      setMigMsg(`이전에 실패했습니다 — ${(e as { message?: string })?.message ?? ''}`);
+      setMigState('ready');
+    }
+  };
+
+  const migDownloadConfig = () => {
+    const blob = new Blob([configFileText(migCfg())], { type: 'application/json' });
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = u; a.download = 'ohome.config.json';
+    a.click();
+    URL.revokeObjectURL(u);
+  };
+
+  const migSwitch = () => {
+    saveLocalConfig(migCfg());
+    toast('새 데이터베이스로 전환합니다 — 새로고침');
+    setTimeout(() => window.location.reload(), 700);
+  };
+
+  const doExport = async (includeMembers: boolean) => {
+    setBusy(true);
+    try {
+      const { blob, dataCount, blobCount } = await exportBackup(includeMembers);
+      const u = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = u;
+      a.download = `ohome-backup${includeMembers ? '-with-members' : ''}-${new Date().toISOString().slice(0, 10)}.zip`;
+      a.click();
+      URL.revokeObjectURL(u);
+      toast(`백업 완료 — 데이터 ${dataCount}건 · 이미지 ${blobCount}개`);
+    } catch {
+      toast('백업 생성에 실패했습니다');
+    }
+    setBusy(false);
+  };
+
+  const doImport = async () => {
+    if (!importFile) return;
+    setBusy(true);
+    try {
+      await importBackup(importFile);
+      toast('복원 완료 — 새로고침합니다');
+      setTimeout(() => window.location.reload(), 800);
+    } catch {
+      toast('복원에 실패했습니다');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="set-sec">
+      <h3>데이터 백업</h3>
+      <div className="d">모든 데이터와 이미지 백업 및 복원</div>
+
+      {serverOn && unsynced.length > 0 && (
+        <div className="set-row" style={{ flexWrap: 'wrap' }}>
+          <div className="l"><b>서버에 올리지 않은 설정 {unsynced.length}건</b><small>서버를 붙이기 전에 이 브라우저에서 꾸민 설정입니다</small></div>
+          <button className="btn btn-ghost" style={{ padding: '9px 18px', opacity: pushing ? 0.5 : 1 }}
+            disabled={pushing} onClick={doPush}>{pushing ? '올리는 중…' : '↑ 설정 올리기'}</button>
+        </div>
+      )}
+      {serverOn && (
+        <div className="set-row" style={{ flexWrap: 'wrap' }}>
+          <div className="l"><b>쓰지 않는 이미지 정리</b>
+            <small>어디에서도 쓰지 않는 파일만 골라 지웁니다</small></div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            {orphans && (
+              <span className="hint">
+                {orphans.length > 0 ? `${orphans.length}개 · ${orphanMB.toFixed(1)}MB` : '정리할 것 없음'}
+              </span>
+            )}
+            <button className="btn btn-ghost" style={{ padding: '9px 18px', opacity: scanning ? 0.5 : 1 }}
+              disabled={scanning} onClick={scanOrphans}>{scanning ? '확인 중…' : '찾아보기'}</button>
+            {orphans && orphans.length > 0 && (
+              <button className="btn btn-accent" style={{ padding: '9px 18px', opacity: scanning ? 0.5 : 1 }}
+                disabled={scanning} onClick={() => setCleanAsk(true)}>{orphans.length}개 지우기</button>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>등록되지 않은 상대 캐릭터 정리</b>
+          <small>어느 자관에도 없는 캐릭터만 골라 지웁니다</small></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span className="hint">
+            {orphanChars.length > 0 ? `${orphanChars.length}명` : '정리할 것 없음'}
+          </span>
+          {orphanChars.length > 0 && (
+            <button className="btn btn-accent" style={{ padding: '9px 18px' }}
+              onClick={() => setCharAsk(true)}>{orphanChars.length}명 지우기</button>
+          )}
+        </div>
+      </div>
+
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>백업 내보내기</b><small>zip 파일로 다운로드</small></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className="btn btn-accent" style={{ padding: '9px 18px', opacity: busy ? 0.5 : 1 }}
+            disabled={busy} onClick={() => doExport(false)}>↓ 데이터만</button>
+          <button className="btn btn-ghost" style={{ padding: '9px 18px', opacity: busy ? 0.5 : 1 }}
+            disabled={busy} onClick={() => doExport(true)}>↓ 회원까지</button>
+        </div>
+      </div>
+
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>백업 가져오기 (복원)</b><small>현재 데이터를 백업 내용으로 덮어씁니다</small></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input id="bkImport" type="file" accept=".zip" style={{ display: 'none' }}
+            onChange={e => { setImportFile(e.target.files?.[0] ?? null); e.target.value = ''; }} />
+          <button className="btn btn-ghost" style={{ height: 35, padding: '0 14px', fontSize: 11 }}
+            onClick={() => document.getElementById('bkImport')?.click()}>
+            {importFile ? importFile.name : '파일 선택'}
+          </button>
+          {importFile && (
+            <button className="btn btn-dark" style={{ padding: '0 18px', fontSize: 11, opacity: busy ? 0.5 : 1 }}
+              disabled={busy} onClick={doImport}>RESTORE</button>
+          )}
+        </div>
+      </div>
+
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>데이터베이스 이전</b><small>다른 프로젝트나 서비스로 옮깁니다</small></div>
+        <button className="btn btn-ghost" style={{ padding: '9px 20px' }}
+          onClick={() => { setMigOpen(true); setMigState('idle'); setMigMsg(''); }}>이전하기</button>
+      </div>
+
+      <Modal open={migOpen} onClose={() => setMigOpen(false)} title="데이터베이스 이전"
+        desc="옮길 곳의 연결 정보를 넣고 확인한 뒤 시작합니다"
+        actions={<>
+          <button className="btn btn-ghost" onClick={() => setMigOpen(false)}>CLOSE</button>
+          {migState === 'ready' && <button className="btn btn-accent" onClick={migRun}>이전 시작</button>}
+          {migState === 'done' && <button className="btn btn-accent" onClick={migSwitch}>새 DB로 전환</button>}
+        </>}>
+        <div className="mini-seg" style={{ marginBottom: 12 }}>
+          <button className={migKind === 'supabase' ? 'on' : ''} onClick={() => setMigKind('supabase')}>Supabase</button>
+          <button className={migKind === 'firebase' ? 'on' : ''} onClick={() => setMigKind('firebase')}>Firebase</button>
+        </div>
+
+        {migKind === 'supabase' ? (
+          <div style={{ display: 'grid', gap: 8 }}>
+            <label className="k-label">Project URL</label>
+            <KInput value={migSb.url} onChange={e => setMigSb(s => ({ ...s, url: e.target.value }))} placeholder="https://xxxx.supabase.co" />
+            <label className="k-label">anon public key</label>
+            <KInput value={migSb.anonKey} onChange={e => setMigSb(s => ({ ...s, anonKey: e.target.value }))} />
+          </div>
+        ) : (
+          <div style={{ display: 'grid', gap: 8 }}>
+            <label className="k-label">설정 붙여넣기 (firebaseConfig)</label>
+            <KTextarea style={{ minHeight: 84, fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 11.5 }}
+              onChange={e => {
+                const v = parseFirebaseSnippet(e.target.value);
+                if (v) setMigFb(f => ({
+                  apiKey: v.apiKey ?? f.apiKey, authDomain: v.authDomain ?? f.authDomain,
+                  projectId: v.projectId ?? f.projectId, storageBucket: v.storageBucket ?? f.storageBucket,
+                  appId: v.appId ?? f.appId,
+                }));
+              }} />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <div><label className="k-label">apiKey</label><KInput value={migFb.apiKey} onChange={e => setMigFb(f => ({ ...f, apiKey: e.target.value }))} /></div>
+              <div><label className="k-label">projectId</label><KInput value={migFb.projectId} onChange={e => setMigFb(f => ({ ...f, projectId: e.target.value }))} /></div>
+            </div>
+            <div><label className="k-label">appId</label><KInput value={migFb.appId} onChange={e => setMigFb(f => ({ ...f, appId: e.target.value }))} /></div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, flexWrap: 'wrap' }}>
+          <button className="btn btn-dark" style={{ height: 33, padding: '0 16px', fontSize: 11 }}
+            disabled={migState === 'checking' || migState === 'running'} onClick={migCheck}>
+            {migState === 'checking' ? '확인 중…' : '연결 확인'}
+          </button>
+          {migState === 'done' && (
+            <button className="btn btn-ghost" style={{ height: 33, padding: '0 14px', fontSize: 11 }}
+              onClick={migDownloadConfig}>ohome.config.json 내려받기</button>
+          )}
+        </div>
+        {migMsg && (
+          <p className={migState === 'done' || migState === 'ready' ? 'setup-ok' : 'setup-err'} style={{ marginTop: 10 }}>
+            {migMsg}
+          </p>
+        )}
+      </Modal>
+
+      <div className="set-row">
+        <div className="l"><b>초기화</b><small>지울 항목 선택</small></div>
+        <button className="btn btn-ghost" style={{ padding: '9px 20px', color: 'var(--accent)' }}
+          onClick={() => { setPicked([]); setResetOpen(true); }}>RESET</button>
+      </div>
+
+      <Modal open={resetOpen} onClose={() => setResetOpen(false)} title="초기화할 항목 선택"
+        desc="체크한 항목만 삭제됩니다"
+        actions={<>
+          <button className="btn btn-ghost" onClick={() => setResetOpen(false)}>CANCEL</button>
+          <button className="btn btn-accent" disabled={picked.length === 0}
+            style={{ opacity: picked.length === 0 ? 0.45 : 1 }}
+            onClick={() => { setResetOpen(false); setResetAsk(true); }}>선택 항목 초기화</button>
+        </>}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
+            onClick={() => setPicked(RESET_CONTENT.map(g => g.key))}>메뉴 데이터 전체</button>
+          <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
+            onClick={() => setPicked([...RESET_CONTENT, ...RESET_EXTRA].map(g => g.key))}>전부 선택</button>
+          <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11, marginLeft: 'auto' }}
+            onClick={() => setPicked([])}>전부 해제</button>
+        </div>
+        <label className="k-label">메뉴별 데이터</label>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, margin: '6px 0 4px' }}>
+          {RESET_CONTENT.map(g => (
+            <KCheck key={g.key} label={g.label} checked={picked.includes(g.key)}
+              onChange={v => toggle(g.key, v)} />
+          ))}
+        </div>
+        <div style={{ height: 1, background: 'var(--line)', margin: '14px 0 12px' }} />
+        <div style={{ display: 'grid', gap: 9 }}>
+          {RESET_EXTRA.map(g => (
+            <KCheck key={g.key} checked={picked.includes(g.key)} onChange={v => toggle(g.key, v)}
+              label={<span>
+                <b style={{ fontSize: 12.5 }}>{g.label}</b>{' '}
+                <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>{g.desc}</small>
+              </span>} />
+          ))}
+        </div>
+      </Modal>
+
+      <ConfirmModal open={cleanAsk} title={`쓰지 않는 이미지 ${orphans?.length ?? 0}개를 지울까요?`}
+        body={`저장소에서 ${orphanMB.toFixed(1)}MB를 비웁니다.`}
+        onClose={() => setCleanAsk(false)}
+        buttons={[
+          { label: '지우기', kind: 'accent', onClick: () => { setCleanAsk(false); void cleanOrphans(); } },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => setCleanAsk(false) },
+        ]} />
+
+      <ConfirmModal open={charAsk} title={`상대 캐릭터 ${orphanChars.length}명을 지울까요?`}
+        body={`${orphanChars.slice(0, 12).map(c => c.name).join(', ')} — 어느 자관에도 등록돼 있지 않은 캐릭터입니다.`}
+        onClose={() => setCharAsk(false)}
+        buttons={[
+          { label: '지우기', kind: 'accent', onClick: () => { setCharAsk(false); cleanChars(); } },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => setCharAsk(false) },
+        ]} />
+
+      <ConfirmModal open={resetAsk} title="선택한 항목을 초기화할까요?"
+        body="삭제한 내용은 복구할 수 없습니다."
+        onClose={() => setResetAsk(false)}
+        buttons={[
+          { label: '초기화', kind: 'accent', onClick: () => {
+            setResetAsk(false);
+            toast('초기화하는 중…');
+            void resetGroups(picked)
+              .then(r => {
+                if (r.failed.length) {
+                  toast(`${r.failed.length}건을 서버에서 지우지 못했습니다`);
+                } else if (serverOn) {
+                  toast('서버에서 선택한 항목을 지웠습니다');
+                } else {
+                  toast('선택한 항목을 초기화했습니다');
+                }
+              })
+              .catch(() => { toast('초기화에 실패했습니다'); })
+              .finally(() => setTimeout(() => window.location.reload(), 1400));
+          } },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => setResetAsk(false) },
+        ]} />
+    </div>
+  );
+}
+
+function MemberPickModal({ initial, onApply, onClose, desc }: {
+  initial: string[]; onApply: (ids: string[]) => void; onClose: () => void;
+  desc?: string;
+}) {
+  const pool = useMembers().filter(p => p.id !== 'admin' && p.role !== 'admin');
+  const [q, setQ] = useState('');
+  const [sel, setSel] = useState<string[]>(initial);
+  const t = q.trim().toLowerCase();
+  const list = pool.filter(p => !t || p.nickname.toLowerCase().includes(t) || p.id.toLowerCase().includes(t));
+  return (
+    <Modal open small title="멤버 선택" onClose={onClose}
+      desc={desc ?? '체크한 회원에게만 이 메뉴가 보입니다'}
+      actions={<>
+        <button className="btn btn-ghost" onClick={onClose}>CANCEL</button>
+        <button className="btn btn-accent" onClick={() => { onApply(sel); onClose(); }}>적용</button>
+      </>}>
+      <div style={{ display: 'grid', gap: 9 }}>
+        <KInput placeholder="닉네임·아이디 검색" value={q} onChange={e => setQ(e.target.value)} />
+        <div style={{ maxHeight: 240, overflow: 'auto', display: 'grid', gap: 4, alignContent: 'start' }}>
+          {list.map(p => (
+            <KCheck key={p.id}
+              label={<span style={{ fontSize: 12.5 }}>{p.nickname} <small style={{ color: 'var(--faint)' }}>{p.id}</small></span>}
+              checked={sel.includes(p.id)}
+              onChange={v => setSel(s => (v ? [...s, p.id] : s.filter(x => x !== p.id)))} />
+          ))}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function MenuPane() {
+  const [ms, patch, msLoaded] = useMenuSettings();
+  const { user } = useAuth();
+  const [visBusy, setVisBusy] = useState(false);
+  const [openAsk, setOpenAsk] = useState<(() => void) | null>(null);
+  const [visAsk, setVisAsk] = useState(false);
+  const [memAsk, setMemAsk] = useState<{ ids: string[]; apply: (ids: string[]) => void; desc?: string } | null>(null);
+  const [commSet, patchComm] = useCommSettings();
+  const { boards, loaded: bLoaded, patchBoard } = useBoards();
+  const toast = useToast();
+  const del = useConfirmDelete();
+  const saved = ms.tree ?? defaultTree();
+  const { map: secMap } = useSections();
+  const { links, setLinks } = useCustomLinks();
+  const [nlName, setNlName] = useState('');
+  const [nlHref, setNlHref] = useState('');
+  const extraAll = [...boardEntries(boards), ...sectionMenuEntries(secMap), ...linkEntries(links)];
+  const defLabel = (href: string) => menuLabelFor(href, extraAll) ?? href;
+
+  const [draft, setDraft] = useState<MenuGroupNode[] | null>(null);
+  const [draftRemoved, setDraftRemoved] = useState<string[] | null>(null);
+  const tree = draft ?? saved;
+  const removed = draftRemoved ?? ms.removedBoards;
+  const dirty = draft !== null && (
+    JSON.stringify(draft) !== JSON.stringify(saved)
+    || JSON.stringify(removed) !== JSON.stringify(ms.removedBoards));
+  const savedKey = JSON.stringify([saved, ms.removedBoards]);
+  useEffect(() => {
+    if (!msLoaded || !bLoaded) return;
+    if (!dirty) { setDraft(saved); setDraftRemoved(ms.removedBoards); }
+  }, [savedKey, msLoaded, bLoaded]);
+
+  const setTree = (t: MenuGroupNode[]) => setDraft(t);
+  const saveAll = () => { patch({ tree, removedBoards: removed }); toast('메뉴가 저장되었습니다'); };
+
+  const applyVis = async () => {
+    const be = backend();
+    if (!be) { toast('서버에 연결돼 있지 않습니다'); return; }
+    setVisBusy(true);
+    try {
+      let n = 0;
+      for (const coll of CONTENT_COLLECTIONS) {
+        const rows = await be.fetchList(coll);
+        const targets = rows.filter(r => visFloorOf(coll, r) !== 'public');
+        if (targets.length) n += await be.refreshVis(coll, targets, user?.id ?? null);
+      }
+      toast(n ? `글 ${n}건을 서버에서도 가렸습니다` : '비공개로 둔 메뉴에 글이 없습니다');
+    } catch (e) {
+      toast(e instanceof Error && e.message ? e.message : '적용하지 못했습니다');
+    }
+    setVisBusy(false);
+  };
+  const revert = () => { setDraft(saved); setDraftRemoved(ms.removedBoards); };
+
+  const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
+  const [leaveAsk, setLeaveAsk] = useState(false);
+  const pendingClick = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const onCapture = (e: MouseEvent) => {
+      if (!dirtyRef.current) return;
+      const t = e.target as HTMLElement | null;
+      const hit = t?.closest?.('.topbar a, .topbar button, .topbar .brand, .set-nav button') as HTMLElement | null;
+      if (!hit) return;
+      e.preventDefault(); e.stopPropagation();
+      pendingClick.current = hit; setLeaveAsk(true);
+    };
+    document.addEventListener('click', onCapture, true);
+    return () => document.removeEventListener('click', onCapture, true);
+  }, []);
+  const [resetAsk, setResetAsk] = useState(false);
+  const [mtab, setMtab] = useState<'basic' | 'perm'>('basic');
+  const [rpGate, setRpGate] = useState('');
+  useEffect(() => { setRpGate(getPageText('rp-gate-desc', '역극은 로그인한 참여자에게만 표시됩니다')); }, []);
+  const leaveWith = (action: 'save' | 'discard') => {
+    if (action === 'save') patch({ tree, removedBoards: removed });
+    else revert();
+    dirtyRef.current = false;
+    setLeaveAsk(false);
+    const el = pendingClick.current;
+    pendingClick.current = null;
+    setTimeout(() => el?.click(), 30);
+  };
+
+  useEffect(() => {
+    if (!msLoaded || !bLoaded) return;
+    let next: MenuGroupNode[] = saved
+      .map(g => (g.href
+        ? (menuLabelFor(g.href, extraAll) === null ? null : g)
+        : { ...g, items: g.items.filter(it => menuLabelFor(it.href, extraAll) !== null) }))
+      .filter((g): g is MenuGroupNode => !!g);
+    if (JSON.stringify(next) !== JSON.stringify(saved)) patch({ tree: next });
+  }, [msLoaded, bLoaded, boards, ms.tree]);
+
+  const placedSet = new Set(tree.flatMap(g => (g.href ? [g.href] : g.items.map(i => i.href))));
+  const unplaced = [
+    ...FEATURES.filter(f => !placedSet.has(f.href)),
+    ...extraAll.map(b => ({ href: b.href, label: b.name })).filter(x => !placedSet.has(x.href)),
+  ];
+
+  const patchGroup = (id: string, p: Partial<MenuGroupNode>) =>
+    setTree(tree.map(g => (g.id === id ? { ...g, ...p } : g)));
+  const markRemoved = (hrefs: string[]) => {
+    const known = new Set(extraAll.map(b => b.href));
+    const bs = hrefs.filter(h => known.has(h));
+    if (bs.length) setDraftRemoved([...new Set([...removed, ...bs])]);
+  };
+  const removeGroup = (g: MenuGroupNode) => {
+    setTree(tree.filter(x => x.id !== g.id));
+    markRemoved(g.href ? [g.href] : g.items.map(i => i.href));
+  };
+  const askRemoveGroup = (g: MenuGroupNode) => del.ask(
+    g.href ? `단독 메뉴 「${g.label}」를 메뉴에서 빼시겠습니까?` : `상위 메뉴 「${g.label}」를 삭제하시겠습니까?`,
+    () => removeGroup(g),
+    '미배치 목록으로 이동하며 데이터는 보존됩니다.');
+  const removeItem = (gid: string, href: string) => {
+    setTree(tree.map(g => (g.id === gid ? { ...g, items: g.items.filter(i => i.href !== href) } : g)));
+    markRemoved([href]);
+  };
+  const moveItem = (fromGid: string, it: MenuLeaf, to: string) => {
+    const stripped = tree.map(g => (g.id === fromGid ? { ...g, items: g.items.filter(i => i.href !== it.href) } : g));
+    if (to === 'solo') {
+      setTree([...stripped, { id: newGroupId(), label: it.label ?? defLabel(it.href), href: it.href, items: [], pageTitle: it.pageTitle }]);
+    } else {
+      setTree(stripped.map(g => (g.id === to ? { ...g, items: [...g.items, it] } : g)));
+    }
+  };
+  const placeUnplaced = (href: string, to: string) => {
+    if (to === 'solo') setTree([...tree, { id: newGroupId(), label: defLabel(href), href, items: [] }]);
+    else setTree(tree.map(g => (g.id === to ? { ...g, items: [...g.items, { href }] } : g)));
+    if (href.startsWith('/board?b=')) setDraftRemoved(removed.filter(h => h !== href));
+  };
+  const groupOptions = (excludeId?: string) => [
+    ...tree.filter(g => !g.href && g.id !== excludeId).map(g => ({ value: g.id, label: `→ ${g.label}` })),
+    { value: 'solo', label: '→ 단독 메뉴' },
+  ];
+
+  const permSel = (label: string, value: MenuPerm, onChange: (v: MenuPerm) => void) => (
+    <KSelect minWidth={110} value={value} onChange={v => onChange(v as MenuPerm)}
+      options={[
+        { value: 'guest', label: `${label}: 방문자` },
+        { value: 'member', label: `${label}: 가입자` },
+        { value: 'admin', label: `${label}: 관리자` },
+      ]} />
+  );
+
+  const extraFor = (href: string) => {
+    switch (href) {
+      case '/gallery': return (
+        <div className="mini-seg">
+          <button className={ms.backupView === 'gal' ? 'on' : ''} onClick={() => patch({ backupView: 'gal' })}>기본: 갤러리</button>
+          <button className={ms.backupView === 'list' ? 'on' : ''} onClick={() => patch({ backupView: 'list' })}>기본: 리스트</button>
+        </div>
+      );
+      case '/comm': return (
+        <div className="mini-seg">
+          <button className={commSet.ratio === '3:4' ? 'on' : ''} onClick={() => patchComm({ ratio: '3:4' })}>비율 3:4</button>
+          <button className={commSet.ratio === '4:3' ? 'on' : ''} onClick={() => patchComm({ ratio: '4:3' })}>비율 4:3</button>
+        </div>
+      );
+      case '/cal': return (
+        <div className="mini-seg">
+          <button className={(ms.calTitle ?? 'en') === 'en' ? 'on' : ''} onClick={() => patch({ calTitle: 'en' })}>AUGUST 2026</button>
+          <button className={ms.calTitle === 'num' ? 'on' : ''} onClick={() => patch({ calTitle: 'num' })}>2026.08</button>
+        </div>
+      );
+      default: return null;
+    }
+  };
+
+  const extraPerm = (href: string) => {
+    if (href === '/rp') {
+      return (
+        <KInput value={rpGate}
+          onChange={e => { setRpGate(e.target.value); setPageText('rp-gate-desc', e.target.value); }}
+          placeholder="비로그인 안내 문구" style={{ width: 210, fontSize: 12 }} />
+      );
+    }
+    if (href === '/board' || href.startsWith('/board?b=')) {
+      const bid = href === '/board' ? MAIN_BOARD_ID : href.slice('/board?b='.length);
+      const bd = boards.find(b => b.id === bid);
+      if (!bd) return null;
+      return (
+        <>
+          <KSelect minWidth={110} value={bd.permWrite}
+            onChange={v => patchBoard(bd.id, { permWrite: v as BoardPerm })}
+            options={[
+              { value: 'member', label: '글쓰기: 가입자' },
+              { value: 'admin', label: '글쓰기: 관리자' },
+            ]} />
+          <KSelect minWidth={110} value={bd.permComment}
+            onChange={v => patchBoard(bd.id, { permComment: v as BoardPerm })}
+            options={[
+              { value: 'guest', label: '댓글: 방문자' },
+              { value: 'member', label: '댓글: 가입자' },
+              { value: 'admin', label: '댓글: 관리자' },
+            ]} />
+        </>
+      );
+    }
+    if (href === '/loadb') {
+      return (
+        <>
+          {permSel('업로드', ms.roadUpload, v => patch({ roadUpload: v }))}
+          {permSel('댓글', ms.roadComment, v => patch({ roadComment: v }))}
+        </>
+      );
+    }
+    if (href === '/gallery' || href.startsWith('/gallery?s=')) {
+      const key = href === '/gallery' ? MAIN_SEC : href.slice('/gallery?s='.length);
+      const gsec = sectionsOf(secMap, 'gallery').find(s2 => s2.id === key || s2.slug === key);
+      if (!gsec) return null;
+      const gw = ms.galWrite?.[gsec.id] ?? 'member';
+      const gwIds = ms.galWriteMembers?.[gsec.id];
+      return (
+        <>
+          {gw === 'member' && (
+            <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+              onClick={() => setMemAsk({
+                ids: gwIds ?? [],
+                desc: '체크한 회원만 이 갤러리에 글을 쓸 수 있습니다',
+                apply: n => {
+                  const next = { ...ms.galWriteMembers };
+                  if (n.length) next[gsec.id] = n; else delete next[gsec.id];
+                  patch({ galWriteMembers: next });
+                },
+              })}>
+              {gwIds?.length ? `글쓰기 멤버 ${gwIds.length}명` : '글쓰기 멤버'}
+            </button>
+          )}
+          <KSelect minWidth={110} value={gw}
+            onChange={v => {
+              const next = { ...ms.galWriteMembers };
+              if (v !== 'member') delete next[gsec.id];
+              patch({ galWrite: { ...ms.galWrite, [gsec.id]: v as MenuPerm }, galWriteMembers: next });
+            }}
+            options={[
+              { value: 'member', label: '글쓰기: 가입자' },
+              { value: 'admin', label: '글쓰기: 관리자' },
+            ]} />
+        </>
+      );
+    }
+    return null;
+  };
+
+  const openChk = (v: MenuVis | undefined, open: boolean | undefined, onChange: (nv: boolean) => void) => (
+    (v ?? 'all') === 'all' ? null : (
+      <KCheck label={<span style={{ fontSize: 11 }}>주소로는 열람 허용</span>} checked={!!open}
+        onChange={nv => { if (nv) setOpenAsk(() => () => onChange(true)); else onChange(false); }} />
+    )
+  );
+
+  const visSel = (v: MenuVis | undefined, onChange: (nv: MenuVis) => void) => (
+    <KSelect minWidth={128} value={v ?? 'all'} onChange={nv => onChange(nv as MenuVis)}
+      options={[
+        { value: 'all', label: '전부 보임' },
+        { value: 'member', label: '비로그인 숨김' },
+        { value: 'admin', label: '관리자만' },
+      ]} />
+  );
+
+  const memberBtn = (v: MenuVis | undefined, ids: string[] | undefined, apply: (ids: string[] | undefined) => void) => (
+    v !== 'member' ? null : (
+      <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+        onClick={() => setMemAsk({ ids: ids ?? [], apply: n => apply(n.length ? n : undefined) })}>
+        {ids?.length ? `멤버 ${ids.length}명` : '멤버 선택'}
+      </button>
+    )
+  );
+
+  return (
+    <div className="set-sec">
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', marginBottom: 14 }}>
+        <h3 style={{ margin: 0 }}>메뉴 관리</h3>
+        {dirty && <span style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600, marginTop: 3 }}>저장 안 된 변경</span>}
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <button className="btn btn-ghost" style={{ padding: '6px 14px', fontSize: 11 }}
+            onClick={() => setResetAsk(true)}>기본 구성</button>
+          <button className="btn btn-ghost" disabled={!dirty} style={{ opacity: dirty ? 1 : 0.45, padding: '6px 14px', fontSize: 11 }}
+            onClick={() => { revert(); toast('저장된 메뉴로 되돌렸습니다'); }}>변경 취소</button>
+          <button className="btn btn-dark" disabled={!dirty} style={{ opacity: dirty ? 1 : 0.45, padding: '6px 18px', fontSize: 11 }}
+            onClick={saveAll}>SAVE</button>
+        </div>
+      </div>
+      <div className="mini-seg" style={{ marginBottom: 14 }}>
+        <button className={mtab === 'basic' ? 'on' : ''} onClick={() => setMtab('basic')}>기본</button>
+        <button className={mtab === 'perm' ? 'on' : ''} onClick={() => setMtab('perm')}>권한</button>
+      </div>
+
+      {mtab === 'perm' ? (
+        <div>
+          <div className="d">
+            공개범위는 메뉴 노출을 정합니다
+          </div>
+          {tree.map(g => (
+            <div key={g.id} style={{ borderBottom: '1px dashed var(--line)', padding: '9px 0' }}>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                <b style={{ fontSize: 13 }}>{g.label}</b>
+                {g.href && <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>{g.href}</small>}
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  {g.href && extraPerm(g.href)}
+                  {openChk(g.vis, g.open, nv => patchGroup(g.id, { open: nv || undefined }))}
+                  {memberBtn(g.vis, g.visMembers, ids => patchGroup(g.id, { visMembers: ids }))}
+                  {visSel(g.vis, nv => patchGroup(g.id, {
+                    vis: nv === 'all' ? undefined : nv,
+                    ...(nv === 'all' ? { open: undefined } : {}),
+                    ...(nv !== 'member' ? { visMembers: undefined } : {}),
+                  }))}
+                </div>
+              </div>
+              {!g.href && g.items.map(it => (
+                <div key={it.href} style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', padding: '6px 0 0 22px' }}>
+                  <span style={{ fontSize: 12.5 }}>{it.label ?? defLabel(it.href)}</span>
+                  <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>{it.href}</small>
+                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    {extraPerm(it.href)}
+                    {openChk(it.vis, it.open, nv => patchGroup(g.id, {
+                      items: g.items.map(x => (x.href === it.href ? { ...x, open: nv || undefined } : x)),
+                    }))}
+                    {memberBtn(it.vis, it.visMembers, ids => patchGroup(g.id, {
+                      items: g.items.map(x => (x.href === it.href ? { ...x, visMembers: ids } : x)),
+                    }))}
+                    {visSel(it.vis, nv => patchGroup(g.id, {
+                      items: g.items.map(x => (x.href === it.href
+                        ? {
+                          ...x, vis: nv === 'all' ? undefined : nv,
+                          ...(nv === 'all' ? { open: undefined } : {}),
+                          ...(nv !== 'member' ? { visMembers: undefined } : {}),
+                        } : x)),
+                    }))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--line)' }}>
+            <b style={{ fontSize: 13 }}>열람 비공개 처리</b>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+              <button className="btn btn-dark" disabled={visBusy || dirty}
+                onClick={() => setVisAsk(true)}>
+                {visBusy ? '적용 중…' : dirty ? 'SAVE 먼저' : '글에도 적용'}
+              </button>
+            </div>
+          </div>
+          {memAsk && (
+            <MemberPickModal initial={memAsk.ids} onApply={memAsk.apply} desc={memAsk.desc}
+              onClose={() => setMemAsk(null)} />
+          )}
+
+          <ConfirmModal open={!!openAsk} title="주소가 있는 모두에게 공개됩니다"
+            body="메뉴에서는 계속 감춰지지만 주소를 아는 사람은 들어와 볼 수 있습니다."
+            onClose={() => setOpenAsk(null)}
+            buttons={[
+              { label: 'CANCEL', kind: 'ghost', onClick: () => setOpenAsk(null) },
+              { label: '알겠습니다', kind: 'dark', onClick: () => { openAsk?.(); setOpenAsk(null); } },
+            ]} />
+
+          <ConfirmModal open={visAsk} title="글 공개범위를 서버에 적용할까요?"
+            body="비공개로 둔 메뉴의 글이 서버에서도 가려집니다."
+            onClose={() => setVisAsk(false)}
+            buttons={[
+              { label: 'CANCEL', kind: 'ghost', onClick: () => setVisAsk(false) },
+              { label: '적용', kind: 'dark', onClick: () => { setVisAsk(false); void applyVis(); } },
+            ]} />
+
+          <div style={{ marginTop: 18 }}>
+            <b style={{ fontSize: 13 }}>이미지 저장 방지</b>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 8 }}>
+              {IMG_PROTECT_AREAS.map(a => (
+                <KCheck key={a.key} label={a.label}
+                  checked={(ms.imgProtect ?? []).includes(a.key)}
+                  onChange={v => patch({
+                    imgProtect: v
+                      ? [...(ms.imgProtect ?? []), a.key]
+                      : (ms.imgProtect ?? []).filter(k => k !== a.key),
+                  })} />
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : (
+      <>
+      <DragList items={tree} keyOf={g => g.id} onReorder={setTree}
+        render={g => (
+          <div style={{ width: '100%', borderBottom: '1px dashed var(--line)', padding: '10px 0' }}>
+            <div className="set-row" style={{ border: 'none', padding: 0 }}>
+              <div className="l" style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span className="drag-h">⠿</span>
+                <KInput value={g.label} onChange={e => patchGroup(g.id, { label: e.target.value })}
+                  style={{ width: 110, fontWeight: 700 }} />
+                {g.href ? (
+                  <>
+                    <span className="cp-lb">타이틀</span>
+                    <KInput value={g.pageTitle ?? ''} placeholder="기본"
+                      onChange={e => patchGroup(g.id, { pageTitle: e.target.value || undefined })}
+                      style={{ width: 120, fontSize: 12 }} />
+                    <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>단독 · {g.href}</small>
+                  </>
+                ) : <span className="pill">상위</span>}
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                {g.href && extraFor(g.href)}
+                <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+                  onClick={() => askRemoveGroup(g)}>{g.href ? '빼기' : 'DELETE'}</button>
+              </div>
+            </div>
+            {!g.href && (
+              <div style={{ padding: '8px 0 0 34px' }}>
+                <DragList items={g.items} keyOf={it => it.href}
+                  onReorder={items => patchGroup(g.id, { items })}
+                  render={it => (
+                    <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', width: '100%', padding: '3px 0' }}>
+                      <span className="drag-h" style={{ fontSize: 11 }}>⠿</span>
+                      <KInput value={it.label ?? ''} placeholder={defLabel(it.href)}
+                        onChange={e => patchGroup(g.id, {
+                          items: g.items.map(x => (x.href === it.href
+                            ? { ...x, label: e.target.value || undefined } : x)),
+                        })}
+                        style={{ width: 110, fontSize: 12 }} />
+                      <span className="cp-lb">타이틀</span>
+                      <KInput value={it.pageTitle ?? ''} placeholder="기본"
+                        onChange={e => patchGroup(g.id, {
+                          items: g.items.map(x => (x.href === it.href
+                            ? { ...x, pageTitle: e.target.value || undefined } : x)),
+                        })}
+                        style={{ width: 120, fontSize: 12 }} />
+                      <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>{it.href}</small>
+                      <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                        {extraFor(it.href)}
+                        <KSelect minWidth={104} value="" placeholder="이동"
+                          onChange={v => moveItem(g.id, it, v)} options={groupOptions(g.id)} />
+                        <button className="btn btn-ghost" style={{ padding: '3px 9px', fontSize: 10.5 }}
+                          onClick={() => removeItem(g.id, it.href)}>빼기</button>
+                      </div>
+                    </div>
+                  )} />
+              </div>
+            )}
+          </div>
+        )} />
+      <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
+        <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
+          onClick={() => setTree([...tree, { id: newGroupId(), label: '새 메뉴', items: [] }])}>＋ ADD MENU</button>
+      </div>
+
+      <h3 style={{ marginTop: 26 }}>미배치 기능</h3>
+      {unplaced.map(f => {
+        const link = links.find(l => l.href === f.href);
+        return (
+          <div key={f.href} className="set-row">
+            <div className="l" style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+              <b style={{ fontSize: 12.5 }}>{f.label}</b>
+              <small style={{ color: 'var(--faint)', fontSize: 10.5 }}>{f.href}</small>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <KSelect minWidth={130} value="" placeholder="배치할 위치"
+                onChange={v => placeUnplaced(f.href, v)} options={groupOptions()} />
+              {link && (
+                <button className="btn btn-ghost" style={{ padding: '3px 9px', fontSize: 10.5 }}
+                  onClick={() => del.ask(`커스텀 링크를 지우시겠습니까?`,
+                    () => setLinks(links.filter(x => x.id !== link.id)))}>삭제</button>
+              )}
+            </div>
+          </div>
+        );
+      })}
+
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 22 }}>
+        <h3 style={{ margin: 0 }}>커스텀 링크</h3>
+      </div>
+      {links.map(l => (
+        <div key={l.id} className="set-row">
+          <div className="l" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <KInput value={l.name} placeholder="메뉴에 보일 이름"
+              onChange={e => setLinks(links.map(x => (x.id === l.id ? { ...x, name: e.target.value } : x)))}
+              style={{ width: 140 }} />
+            <KInput value={l.href} placeholder="/rels/latte 또는 풀주소"
+              onChange={e => setLinks(links.map(x => (x.id === l.id ? { ...x, href: e.target.value } : x)))}
+              onBlur={e => setLinks(links.map(x => (x.id === l.id ? { ...x, href: toInternalPath(e.target.value) } : x)))}
+              style={{ width: 260 }} />
+          </div>
+          <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+            onClick={() => del.ask(`커스텀 링크를 지우시겠습니까?`,
+              () => {
+                setLinks(links.filter(x => x.id !== l.id));
+                setTree(tree.map(g => ({ ...g, items: g.items.filter(i => i.href !== l.href) })).filter(g => g.href !== l.href));
+              })}>DELETE</button>
+        </div>
+      ))}
+      <div className="set-row" style={{ borderTop: '1px dashed var(--line)' }}>
+        <div className="l" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <KInput value={nlName} placeholder="메뉴에 보일 이름" onChange={e => setNlName(e.target.value)} style={{ width: 140 }} />
+          <KInput value={nlHref} placeholder="/rels/latte 또는 풀주소" onChange={e => setNlHref(e.target.value)} style={{ width: 260 }} />
+        </div>
+        <button className="btn btn-dark" style={{ padding: '4px 12px', fontSize: 10.5 }}
+          onClick={() => {
+            if (!nlName.trim()) { toast('메뉴에 보일 이름을 입력해 주세요'); return; }
+            const href = toInternalPath(nlHref);
+            if (!href || href === '/') { toast('이동할 주소를 입력해 주세요'); return; }
+            setLinks([...links, { id: newId(), name: nlName.trim(), href }]);
+            setNlName(''); setNlHref('');
+            toast('링크가 만들어졌습니다');
+          }}>＋ ADD</button>
+      </div>
+      </>
+      )}
+
+      {del.element}
+      <ConfirmModal open={resetAsk} title="메뉴를 기본 구성으로 되돌리시겠습니까?"
+        body="기본 제공 메뉴 구성으로 편집 화면이 바뀝니다."
+        onClose={() => setResetAsk(false)}
+        buttons={[
+          { label: 'RESET', kind: 'dark', onClick: () => { setDraft(defaultTree()); setDraftRemoved([]); setResetAsk(false); } },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => setResetAsk(false) },
+        ]} />
+      <ConfirmModal open={leaveAsk} title="메뉴가 저장되지 않았습니다"
+        body="이대로 이동하면 변경사항이 사라집니다."
+        onClose={() => { pendingClick.current = null; setLeaveAsk(false); }}
+        buttons={[
+          { label: '저장 후 이동', kind: 'dark', onClick: () => leaveWith('save') },
+          { label: '저장하지 않고 이동', kind: 'ghost', onClick: () => leaveWith('discard') },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => { pendingClick.current = null; setLeaveAsk(false); } },
+        ]} />
+    </div>
+  );
+}
+
+function TrpgPane() {
+  const [settings, patch] = useTrpgSettings();
+  const [ms, patchMenu] = useMenuSettings();
+  const [lockDesc, setLockDesc] = useState('');
+  useEffect(() => { setLockDesc(getPageText('trpg-lock-desc', '비밀번호를 입력하면 열람할 수 있습니다')); }, []);
+  const patchStatus = (k: DotoriStatus, p: Partial<(typeof settings.statuses)[DotoriStatus]>) =>
+    patch({ statuses: { ...settings.statuses, [k]: { ...settings.statuses[k], ...p } } });
+  const colToggle = (list: string[], k: keyof MenuSettings) => (
+    <div style={{ flex: 1, display: 'grid', gridTemplateColumns: `repeat(${PLAYLOG_COLS.length}, 1fr)`, gap: 6, justifyItems: 'center' }}>
+      {PLAYLOG_COLS.map(c => (
+        <KCheck key={c.key} label={c.label} checked={list.includes(c.key)}
+          onChange={v => patchMenu({ [k]: v ? [...list, c.key] : list.filter(x => x !== c.key) } as Partial<MenuSettings>)} />
+      ))}
+    </div>
+  );
+  return (
+    <div className="set-sec">
+      <h3>로그 열람 안내 문구</h3>
+      <div className="d">비밀번호를 건 로그에 들어갔을 때 보이는 문구입니다</div>
+      <div className="set-row" style={{ alignItems: 'center' }}>
+        <div className="l"><b>비밀번호 안내</b></div>
+        <KInput value={lockDesc}
+          onChange={e => { setLockDesc(e.target.value); setPageText('trpg-lock-desc', e.target.value); }}
+          placeholder="비밀번호를 입력하면 열람할 수 있습니다" style={{ width: 300 }} />
+      </div>
+
+      <h3>도토리 상태 카테고리</h3>
+      {DOTORI_STATUS_KEYS.map(k => {
+        const st = settings.statuses[k];
+        return (
+          <div key={k} className="set-row" style={{ alignItems: 'center' }}>
+            <div className="l">
+              <span className="dt-badge" style={{ ...dotoriBadgeStyle(st), position: 'static' }}>{st.label || '상태'}</span>
+            </div>
+            <div className="cp-group" style={{ justifyContent: 'flex-end' }}>
+              <KInput value={st.label} onChange={e => patchStatus(k, { label: e.target.value })}
+                style={{ width: 100, textAlign: 'right' }} />
+              <span className="cp-lb">배경</span>
+              <ColorField value={st.bg} onChange={hex => patchStatus(k, { bg: hex })} />
+              <span className="cp-lb">테두리</span>
+              <ColorField value={st.border} onChange={hex => patchStatus(k, { border: hex })} />
+              <span className="cp-lb">글씨</span>
+              <ColorField value={st.fg} onChange={hex => patchStatus(k, { fg: hex })} />
+            </div>
+          </div>
+        );
+      })}
+
+      <hr style={{ margin: '24px 0', border: 'none', borderTop: '1.5px solid var(--line)' }} />
+      <h3>플레이기록 표시 열</h3>
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l" style={{ width: 64, flexShrink: 0 }}><b>PC</b></div>
+        {colToggle(ms.playlogPc, 'playlogPc')}
+      </div>
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l" style={{ width: 64, flexShrink: 0 }}><b>모바일</b></div>
+        {colToggle(ms.playlogMobile, 'playlogMobile')}
+      </div>
+    </div>
+  );
+}
+
+function MemoPane() {
+  const [settings, patch] = useMemoSettings();
+  return (
+    <div className="set-sec">
+      <h3>스티커 메모장</h3>
+      <div className="set-row">
+        <div className="l"><b>회원 작성 허용</b><small>끄면 관리자만 메모를 붙일 수 있습니다</small></div>
+        <KToggle checked={settings.allowMember} onChange={v => patch({ allowMember: v })} />
+      </div>
+      <div className="set-row">
+        <div className="l"><b>작성자 표시</b><small>포스트잇 상단에 작성자 닉네임 표시</small></div>
+        <KToggle checked={settings.showAuthor} onChange={v => patch({ showAuthor: v })} />
+      </div>
+    </div>
+  );
+}
+
+function ThreadPane() {
+  const [settings, patch] = useThreadSettings();
+  const [works] = useLocalList<ThreadWork>('ohome.threads.v1', THREAD_SEED);
+  const del = useConfirmDelete();
+  const { list } = useSections();
+  const secs = list('threads');
+  const [secId, setSecId] = useState(MAIN_SEC);
+  const cur = secs.find(s => s.id === secId) ? secId : MAIN_SEC;
+  const cats = threadCats(settings, cur);
+  const setCats = (next: ThreadCat[]) => patch(threadCatsPatch(settings, cur, next));
+  const patchCat = (id: string, p: Partial<ThreadCat>) =>
+    setCats(cats.map(c => (c.id === id ? { ...c, ...p } : c)));
+  return (
+    <div className="set-sec">
+      <h3>기본 보기</h3>
+      <div className="set-row">
+        <div className="l"><b>첫 화면</b></div>
+        <div className="mini-seg">
+          <button className={settings.defaultView === 'thread' ? 'on' : ''}
+            onClick={() => patch({ defaultView: 'thread' })}>타래 보기</button>
+          <button className={settings.defaultView === 'list' ? 'on' : ''}
+            onClick={() => patch({ defaultView: 'list' })}>리스트 보기</button>
+        </div>
+      </div>
+
+      <h3 style={{ marginTop: 26 }}>분류 리스트</h3>
+      {secs.length > 1 && (
+        <div className="mini-seg" style={{ flexWrap: 'wrap', marginBottom: 10 }}>
+          {secs.map(s => (
+            <button key={s.id} className={cur === s.id ? 'on' : ''} onClick={() => setSecId(s.id)}>{s.name}</button>
+          ))}
+        </div>
+      )}
+      <DragList items={cats} keyOf={c => c.id} onReorder={next => setCats(next)}
+        render={c => (
+          <div className="set-row" style={{ width: '100%' }}>
+            <div className="l" style={{ display: 'flex', gap: 11, alignItems: 'center' }}>
+              <span className="drag-h">⠿</span>
+              <span className="pill" style={threadBadgeStyle(c)}>{c.label || '분류'}</span>
+            </div>
+            <div className="cp-group" style={{ justifyContent: 'flex-end' }}>
+              <KInput value={c.label} onChange={e => patchCat(c.id, { label: e.target.value })}
+                style={{ width: 100, textAlign: 'right' }} />
+              <span className="cp-lb">배경</span>
+              <ColorField value={c.bg ?? '#1d2025'} onChange={hex => patchCat(c.id, { bg: hex })} />
+              <span className="cp-lb">테두리</span>
+              <ColorField value={c.border ?? c.bg ?? '#1d2025'} onChange={hex => patchCat(c.id, { border: hex })} />
+              <span className="cp-lb">글씨</span>
+              <ColorField value={c.fg ?? '#ffffff'} onChange={hex => patchCat(c.id, { fg: hex })} />
+              <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+                onClick={() => {
+                  const used = works.filter(w => w.catId === c.id && inSection(w.secId, cur)).length;
+                  del.ask(`분류 「${c.label}」를 삭제하시겠습니까?`,
+                    () => setCats(cats.filter(x => x.id !== c.id)),
+                    used > 0 ? `이 분류의 타래 ${used}개는 유지되지만 분류가 「기타」로 표시됩니다.` : undefined);
+                }}>DELETE</button>
+            </div>
+          </div>
+        )} />
+      <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
+        <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
+          onClick={() => setCats([...cats, { id: newId(), label: '새 분류' }])}>
+          ＋ ADD
+        </button>
+      </div>
+      {del.element}
+    </div>
+  );
+}
+
+function CommBadgeRows({ list, shape, onChange, fixedIds }: {
+  list: CommBadge[]; shape: 'round' | 'pill';
+  onChange: (next: CommBadge[]) => void;
+  fixedIds: string[];
+}) {
+  const del = useConfirmDelete();
+  const patch = (id: string, p: Partial<CommBadge>) =>
+    onChange(list.map(b => (b.id === id ? { ...b, ...p } : b)));
+  return (
+    <>
+      {list.map(b => (
+        <div key={b.id} className="set-row" style={{ alignItems: 'center' }}>
+          <div className="l"><span style={badgeStyle(b, shape)}>{b.label || '뱃지'}</span></div>
+          <div className="cp-group" style={{ justifyContent: 'flex-end' }}>
+            <KInput value={b.label} onChange={e => patch(b.id, { label: e.target.value })}
+              style={{ width: 90, textAlign: 'right' }} />
+            <span className="cp-lb">배경</span>
+            <ColorField value={b.bg} onChange={hex => patch(b.id, { bg: hex })} />
+            <span className="cp-lb">테두리</span>
+            <ColorField value={b.border} onChange={hex => patch(b.id, { border: hex })} />
+            <span className="cp-lb">글씨</span>
+            <ColorField value={b.fg} onChange={hex => patch(b.id, { fg: hex })} />
+            {!fixedIds.includes(b.id) && (
+              <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+                onClick={() => del.ask(`뱃지를 삭제하시겠습니까?`, () => onChange(list.filter(x => x.id !== b.id)))}>DELETE</button>
+            )}
+          </div>
+        </div>
+      ))}
+      <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+        <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
+          onClick={() => onChange([...list, { id: newId(), label: '새 뱃지', bg: '#5d636d', border: '#4a505a', fg: '#ffffff' }])}>
+          ＋ ADD BADGE
+        </button>
+      </div>
+      {del.element}
+    </>
+  );
+}
+
+function CommPane() {
+  const [st, patch] = useCommSettings();
+  return (
+    <div className="set-sec">
+      <h3>커미션</h3>
+      <div className="set-row">
+        <div className="l"><b>썸네일 비율</b></div>
+        <div className="mini-seg">
+          <button className={st.ratio === '3:4' ? 'on' : ''} onClick={() => patch({ ratio: '3:4' })}>3:4 세로</button>
+          <button className={st.ratio === '4:3' ? 'on' : ''} onClick={() => patch({ ratio: '4:3' })}>4:3 가로</button>
+        </div>
+      </div>
+
+      <div className="set-row">
+        <div className="l"><b>뱃지 모양</b></div>
+        <div className="mini-seg">
+          <button className={st.badgeShape === 'round' ? 'on' : ''} onClick={() => patch({ badgeShape: 'round' })}>라운드 스퀘어</button>
+          <button className={st.badgeShape === 'pill' ? 'on' : ''} onClick={() => patch({ badgeShape: 'pill' })}>동그란 필</button>
+        </div>
+      </div>
+
+      <div className="set-row">
+        <div className="l"><b>전체 슬롯</b></div>
+        <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+          <span style={{ fontSize: 11.5, color: 'var(--sub)' }}>총</span>
+          <KStep value={st.totalSlot} min={1} max={50} onChange={v => patch({ totalSlot: v, totalUsed: Math.min(st.totalUsed, v) })} />
+          <span style={{ fontSize: 11.5, color: 'var(--sub)' }}>사용</span>
+          <KStep value={st.totalUsed} min={0} max={st.totalSlot} onChange={v => patch({ totalUsed: v })} />
+        </div>
+      </div>
+
+      <h3 style={{ marginTop: 26 }}>커미션 뱃지</h3>
+      <CommBadgeRows list={st.commBadges} shape={st.badgeShape} fixedIds={['open', 'closed', 'ready']}
+        onChange={next => patch({ commBadges: next })} />
+
+      <hr style={{ margin: '24px 0', border: 'none', borderTop: '1.5px solid var(--line)' }} />
+      <h3>신청자 리스트 뱃지</h3>
+      <CommBadgeRows list={st.applyBadges} shape={st.badgeShape} fixedIds={['wait', 'working', 'done']}
+        onChange={next => patch({ applyBadges: next })} />
+    </div>
+  );
+}
+
+function BgmTrackRow({ t, onPatch, onDelete }: {
+  t: BgmTrack; onPatch: (p: Partial<BgmTrack>) => void; onDelete: () => void;
+}) {
+  const toast = useToast();
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(t.title);
+  const [desc, setDesc] = useState(t.desc);
+  const [url, setUrl] = useState(t.videoId);
+
+  if (editing) {
+    return (
+      <div style={{ display: 'grid', gap: 7, padding: '10px 0', borderBottom: '1px dashed var(--line)', width: '100%' }}>
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+          <KInput placeholder="곡 제목" value={title} onChange={e => setTitle(e.target.value)} style={{ maxWidth: 150 }} />
+          <KInput placeholder="설명 (선택)" value={desc} onChange={e => setDesc(e.target.value)} style={{ flex: 1, minWidth: 130 }} />
+        </div>
+        <div style={{ display: 'flex', gap: 7 }}>
+          <KInput placeholder="유튜브 URL 또는 영상 ID" value={url} onChange={e => setUrl(e.target.value)} />
+          <button className="btn btn-dark" style={{ whiteSpace: 'nowrap' }}
+            onClick={() => {
+              const vid = parseVideoId(url);
+              if (!title.trim() || !vid) { toast('제목과 올바른 유튜브 URL을 입력해 주세요'); return; }
+              onPatch({ title: title.trim(), desc: desc.trim(), videoId: vid });
+              setEditing(false);
+              toast('곡이 수정되었습니다');
+            }}>SAVE</button>
+          <button className="btn btn-ghost" style={{ whiteSpace: 'nowrap' }}
+            onClick={() => { setEditing(false); setTitle(t.title); setDesc(t.desc); setUrl(t.videoId); }}>CANCEL</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="set-row" style={{ width: '100%' }}>
+      <div className="l" style={{ display: 'flex', gap: 11, alignItems: 'center' }}>
+        <span className="drag-h">⠿</span>
+        <div><b>{t.title}</b><small>{t.desc || t.videoId}</small></div>
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+          onClick={() => setEditing(true)}>EDIT</button>
+        <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+          onClick={onDelete}>DELETE</button>
+      </div>
+    </div>
+  );
+}
+
+function BgmPane() {
+  const { state, setTracks, addTrack, removeTrack, setSettings } = useBgm();
+  const toast = useToast();
+  const del = useConfirmDelete();
+  const [title, setTitle] = useState('');
+  const [desc, setDesc] = useState('');
+  const [url, setUrl] = useState('');
+
+  const add = () => {
+    if (addTrack(title, desc, url)) {
+      setTitle(''); setDesc(''); setUrl('');
+      toast('곡이 추가되었습니다');
+    } else {
+      toast('제목과 올바른 유튜브 URL을 입력해 주세요');
+    }
+  };
+
+  return (
+    <div className="set-sec">
+      <h3>BGM</h3>
+      <DragList
+        items={state.tracks}
+        keyOf={t => t.id}
+        onReorder={setTracks}
+        render={t => (
+          <BgmTrackRow t={t}
+            onPatch={p => setTracks(state.tracks.map(x => (x.id === t.id ? { ...x, ...p } : x)))}
+            onDelete={() => del.ask(`곡을 삭제하시겠습니까?`, () => removeTrack(t.id))} />
+        )}
+      />
+      {del.element}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+        <KInput placeholder="곡 제목" value={title} onChange={e => setTitle(e.target.value)} style={{ maxWidth: 150 }} />
+        <KInput placeholder="설명 (선택)" value={desc} onChange={e => setDesc(e.target.value)} style={{ maxWidth: 130 }} />
+        <KInput placeholder="유튜브 URL" value={url} onChange={e => setUrl(e.target.value)} style={{ flex: 1, minWidth: 180 }} />
+        <button className="btn btn-dark" onClick={add}>＋ ADD</button>
+      </div>
+
+      <div className="set-row" style={{ marginTop: 16 }}>
+        <div className="l"><b>기본 볼륨</b></div>
+        <KStep value={state.settings.volume} min={0} max={100} suffix="%" onChange={v => setSettings({ volume: v })} />
+      </div>
+      <div className="set-row">
+        <div className="l"><b>플레이어 위치</b></div>
+        <div className="mini-seg">
+          <button className={state.settings.position === 'br' ? 'on' : ''} onClick={() => setSettings({ position: 'br' })}>오른쪽 아래</button>
+          <button className={state.settings.position === 'bl' ? 'on' : ''} onClick={() => setSettings({ position: 'bl' })}>왼쪽 아래</button>
+        </div>
+      </div>
+      <div className="set-row">
+        <div className="l"><b>플레이어 표시</b></div>
+        <KToggle checked={state.settings.enabled} onChange={v => setSettings({ enabled: v })} />
+      </div>
+    </div>
+  );
+}
+
+function FontRow({ f }: { f: FontDef }) {
+  const { fonts, familyOf, updateFont, removeFont, resetFont, setFontPair } = useFonts();
+  const del = useConfirmDelete();
+  const toast = useToast();
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(f.name);
+  const [family, setFamily] = useState(f.family);
+  const [cssUrl, setCssUrl] = useState(fontCssUrl(f) ?? '');
+
+  if (editing) {
+    return (
+      <div style={{ display: 'grid', gap: 7, padding: '10px 0', borderBottom: '1px dashed var(--line)' }}>
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center' }}>
+          <KInput placeholder="표시 이름" value={name} onChange={e => setName(e.target.value)} style={{ maxWidth: 160 }} />
+          {f.fileId ? (
+            <>
+              <span className="cp-lb">한글 페어</span>
+              <KSelect minWidth={150} value={f.pairId ?? ''}
+                onChange={v => setFontPair(f.id, v || undefined)}
+                options={[{ value: '', label: '페어 없음' },
+                  ...fonts.filter(x => x.id !== f.id).map(x => ({ value: x.id, label: x.name }))]} />
+            </>
+          ) : (
+            <>
+              <KInput placeholder="font-family 값" value={family} onChange={e => setFamily(e.target.value)} style={{ flex: 1, minWidth: 160 }} />
+              <span className="cp-lb">한글 페어</span>
+              <KSelect minWidth={140} value={f.pairId ?? ''}
+                onChange={v => setFontPair(f.id, v || undefined)}
+                options={[{ value: '', label: '페어 없음' },
+                  ...fonts.filter(x => x.id !== f.id).map(x => ({ value: x.id, label: x.name }))]} />
+            </>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 7 }}>
+          {!f.fileId && <KInput placeholder="CSS URL" value={cssUrl} onChange={e => setCssUrl(e.target.value)} />}
+          <button className="btn btn-dark" style={{ whiteSpace: 'nowrap', marginLeft: f.fileId ? 'auto' : undefined }}
+            onClick={() => {
+              if (updateFont(f.id, { name, family: f.fileId ? f.family : family, cssUrl: f.fileId ? '' : cssUrl })) { setEditing(false); toast('폰트가 수정되었습니다'); }
+              else toast('이름과 값을 입력해 주세요');
+            }}>SAVE</button>
+          {f.builtin && (
+            <button className="btn btn-ghost" style={{ whiteSpace: 'nowrap' }}
+              onClick={() => { resetFont(f.id); setEditing(false); toast('기본값으로 되돌렸습니다'); }}>기본값으로</button>
+          )}
+          <button className="btn btn-ghost" style={{ whiteSpace: 'nowrap' }}
+            onClick={() => { setEditing(false); setName(f.name); setFamily(f.family); setCssUrl(fontCssUrl(f) ?? ''); }}>CANCEL</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="set-row">
+      <div className="l" style={{ minWidth: 0 }}>
+        <b style={{ fontFamily: familyOf(f.id), fontSize: 15 }}>{f.name} — 가나다 ABC 123</b>
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+        <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+          onClick={() => setEditing(true)}>EDIT</button>
+        {!f.locked && (
+          <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
+            onClick={() => del.ask(`폰트를 삭제하시겠습니까?`, () => removeFont(f.id))}>DELETE</button>
+        )}
+      </div>
+      {del.element}
+    </div>
+  );
+}
+
+function FontPane() {
+  const { fonts, hiddenCount, addFont, addFontFile, restoreBuiltins } = useFonts();
+  const toast = useToast();
+  const [name, setName] = useState('');
+  const [family, setFamily] = useState('');
+  const [cssUrl, setCssUrl] = useState('');
+  const [webPairOn, setWebPairOn] = useState(false);
+  const [webPair, setWebPair] = useState('');
+  const [upPair, setUpPair] = useState('');
+
+  const uploadFontFile = async (f: File | undefined) => {
+    if (!f) return;
+    const name = f.name.replace(/\.(woff2?|ttf|otf)$/i, '');
+    if (await addFontFile(name, f, upPair || undefined)) { setUpPair(''); toast('폰트가 등록되었습니다'); }
+  };
+
+  return (
+    <div className="set-sec">
+      <h3>폰트 라이브러리</h3>
+      {fonts.map(f => <FontRow key={f.id} f={f} />)}
+      {hiddenCount > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }} onClick={restoreBuiltins}>
+            삭제한 기본 폰트 복원
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsInner() {
+  const { isAdmin } = useAuth();
+  const router = useRouter();
+  const params = useSearchParams();
+  const [tab, setTabState] = useState<(typeof CATEGORIES)[number]>('디자인');
+  const urlTab = params.get('tab');
+  useEffect(() => {
+    if (urlTab && (CATEGORIES as readonly string[]).includes(urlTab)) setTabState(urlTab as (typeof CATEGORIES)[number]);
+    else if (!urlTab) setTabState('디자인');
+  }, [urlTab]);
+  const setTab = (t: (typeof CATEGORIES)[number]) => {
+    setTabState(t);
+    router.push(`/settings?tab=${encodeURIComponent(t)}`);
+  };
+
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width:620px)');
+    const f = () => setIsMobile(mq.matches);
+    f();
+    mq.addEventListener('change', f);
+    return () => mq.removeEventListener('change', f);
+  }, []);
+
+  const { dirty: themeDirty, discard: themeDiscard, save: themeSave } = useTheme();
+  const { rolesDirty, saveRoles, discardRoles } = useFonts();
+  const siteDraft = useSiteDraft();
+  const dirty = themeDirty || rolesDirty || siteDraft.dirty;
+  const save = () => { themeSave(); saveRoles(); siteDraft.save(); };
+  const discard = () => { themeDiscard(); discardRoles(); siteDraft.discard(); };
+  const themeRef = useRef({ dirty, discard });
+  themeRef.current = { dirty, discard };
+  useEffect(() => () => { if (themeRef.current.dirty) themeRef.current.discard(); }, []);
+
+  const [leaveAsk, setLeaveAsk] = useState(false);
+  const pendingClick = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const onCapture = (e: MouseEvent) => {
+      if (!themeRef.current.dirty) return;
+      const t = e.target as HTMLElement | null;
+      const hit = t?.closest?.('.topbar a, .topbar button, .topbar .brand') as HTMLElement | null;
+      if (!hit) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pendingClick.current = hit;
+      setLeaveAsk(true);
+    };
+    document.addEventListener('click', onCapture, true);
+    return () => document.removeEventListener('click', onCapture, true);
+  }, []);
+  const leaveWith = (action: 'save' | 'discard') => {
+    if (action === 'save') save(); else discard();
+    setLeaveAsk(false);
+    const el = pendingClick.current;
+    pendingClick.current = null;
+    setTimeout(() => el?.click(), 30);
+  };
+
+  if (!isAdmin) {
+    return (
+      <section className="page">
+        <div className="page-head"><PageTitle>SETTINGS</PageTitle><p>관리자 전용 페이지</p></div>
+        <div className="panel" style={{ textAlign: 'center', padding: 56 }}>
+          <p style={{ fontSize: 13, color: 'var(--faint)' }}>관리자로 로그인하면 환경설정을 사용할 수 있습니다.</p>
+        </div>
+      </section>
+    );
+  }
+  if (isMobile) {
+    return (
+      <section className="page">
+        <div className="page-head"><PageTitle>SETTINGS</PageTitle><p>PC 전용 페이지</p></div>
+        <div className="panel" style={{ textAlign: 'center', padding: 56 }}>
+          <p style={{ fontSize: 13, color: 'var(--faint)' }}>환경설정은 PC 화면에서 이용할 수 있습니다.</p>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="page">
+      <div className="page-head">
+        <PageTitle>SETTINGS</PageTitle>
+        <EditableDesc k="settings-desc" def="노코드 커스터마이징" />
+      </div>
+
+      <ConfirmModal open={leaveAsk} title="테마가 저장되지 않았습니다"
+        body="이대로 이동하면 변경사항이 사라집니다."
+        onClose={() => { pendingClick.current = null; setLeaveAsk(false); }}
+        buttons={[
+          { label: '저장 후 이동', kind: 'dark', onClick: () => leaveWith('save') },
+          { label: '저장하지 않고 이동', kind: 'ghost', onClick: () => leaveWith('discard') },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => { pendingClick.current = null; setLeaveAsk(false); } },
+        ]} />
+      <div className="settings-layout">
+        <div className="panel set-nav">
+          {CATEGORIES.map(c => (
+            <button key={c} className={tab === c ? 'on' : ''} onClick={() => setTab(c)}>{c}</button>
+          ))}
+        </div>
+        <div className="panel" style={{ padding: 26 }}>
+          {tab === '디자인' ? (
+            <DesignPane />
+          ) : tab === '메인 페이지' ? (
+            <MainPagePane />
+          ) : tab === '위젯' ? (
+            <WidgetsPane />
+          ) : tab === '메뉴 관리' ? (
+            <MenuPane />
+          ) : tab === '게시판 관리' ? (
+            <BoardPane />
+          ) : tab === '자관 질문' ? (
+            <RelQPane />
+          ) : tab === '커미션' ? (
+            <CommPane />
+          ) : tab === 'TRPG' ? (
+            <TrpgPane />
+          ) : tab === '감상타래' ? (
+            <ThreadPane />
+          ) : tab === '메모장' ? (
+            <MemoPane />
+          ) : tab === '무드 리스트' ? (
+            <MoodPane />
+          ) : tab === 'BGM' ? (
+            <BgmPane />
+          ) : tab === '폰트' ? (
+            <FontPane />
+          ) : tab === '마우스 커서' ? (
+            <CursorPane />
+          ) : tab === '회원/보안' ? (
+            <MemberPane />
+          ) : tab === '데이터 백업' ? (
+            <DataPane />
+          ) : (
+            <div className="set-sec">
+              <h3>{tab}</h3>
+              <div className="d">설정 항목이 없습니다</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default function SettingsPage() {
+  return <Suspense fallback={<section className="page" />}><SettingsInner /></Suspense>;
+}
